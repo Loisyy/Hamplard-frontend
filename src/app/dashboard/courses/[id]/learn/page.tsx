@@ -1,266 +1,146 @@
-"use client";
+'use client';
 
-import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import {
   CheckCircle2, Circle, ChevronDown, ChevronRight,
-  Download, Loader2, ArrowLeft, Award, SkipForward, MessageSquare,
+  Download, Loader2, ArrowLeft, Menu, X,
 } from 'lucide-react';
 import Link from 'next/link';
 import { coursesApi, enrollmentsApi, lessonsApi } from '@/lib/api/services';
+import { MaterialsList } from '@/components/learn/MaterialsList';
 import { formatDuration, cn } from '@/lib/utils';
-import { sanitizeHtml } from '@/lib/utils/sanitize';
-import CourseCompletionModal from '@/components/learn/CourseCompletionModal';
-import { AssignmentSubmission } from '@/components/learn/AssignmentSubmission';
-import { VideoPlayer } from '@/components/learn/VideoPlayer';
-import { AutoplayCountdown } from '@/components/learn/AutoplayCountdown';
-import NotesPanel from '@/components/learn/NotesPanel';
-import { QuizComponent } from '@/components/learn/QuizComponent';
-import { Breadcrumb } from '@/components/ui/Breadcrumb';
-import type { Course, Enrollment, Lesson, QuizQuestion } from '@/types';
-
-// ── Constants ──────────────────────────────────────────────────────────────
-const AUTOPLAY_STORAGE_KEY = 'hamplard:autoplay';
-
-// SidebarTab type
-type SidebarTab = 'lessons' | 'notes' | 'qa';
-
-// Fallback questions shown when a QUIZ lesson has no quiz data
-const DEFAULT_QUIZ_QUESTIONS: QuizQuestion[] = [];
-
-// ── Helpers ────────────────────────────────────────────────────────────────
-
-/** Returns the flat ordered list of all lessons across every module */
-function flatLessons(course: Course): Lesson[] {
-  return course.modules?.flatMap((m) => m.lessons) ?? [];
-}
-
-// ── Component ──────────────────────────────────────────────────────────────
+import type { Course, Enrollment, Lesson, LessonProgress } from '@/types';
 
 export default function LearnPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
   const searchParams = useSearchParams();
-  // requestedLessonId reserved for future deep-link support
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const _requestedLessonId = searchParams.get("lesson");
+  const lessonParam = searchParams.get('lesson');
 
-  const [course, setCourse] = useState<Course | null>(null);
-  const [enrollment, setEnrollment] = useState<Enrollment | null>(null);
-  const [activeLesson, setActiveLesson] = useState<Lesson | null>(null);
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState<'notFound' | 'network' | null>(null);
-  const [marking, setMarking] = useState(false);
-  const [markError, setMarkError] = useState<string | null>(null);
-  const [sidebarTab, setSidebarTab] = useState<SidebarTab>("lessons");
-  const [showCompletionModal, setShowCompletionModal] = useState(false);
-
-  // ── Autoplay state ───────────────────────────────────────────────────────
-  const [autoplay, setAutoplay] = useState<boolean>(() => {
-    if (typeof window === 'undefined') return true;
-    const stored = window.localStorage.getItem(AUTOPLAY_STORAGE_KEY);
-    return stored === null ? true : stored === 'true';
-  });
-  const [showCountdown, setShowCountdown] = useState(false);
-
+  const [course,      setCourse]      = useState<Course | null>(null);
+  const [enrollment,  setEnrollment]  = useState<Enrollment | null>(null);
+  const [activeLesson,setActiveLesson]= useState<Lesson | null>(null);
+  const [expanded,    setExpanded]    = useState<Record<string, boolean>>({});
+  const [loading,     setLoading]     = useState(true);
+  const [marking,     setMarking]     = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const progressRef = useRef<NodeJS.Timeout | null>(null);
-  const previousCompletedCountRef = useRef<number | null>(null);
-  const hasInitializedCompletionState = useRef(false);
 
-  // videoRef forwarded into VideoPlayer so NotesPanel can read current time
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-
-  // ── Derived: next lesson ─────────────────────────────────────────────────
-  const nextLesson = useMemo<Lesson | null>(() => {
-    if (!course || !activeLesson) return null;
-    const all = flatLessons(course);
-    const idx = all.findIndex((l) => l.id === activeLesson.id);
-    return idx >= 0 && idx < all.length - 1 ? all[idx + 1] : null;
-  }, [course, activeLesson]);
-
-  // selectLesson: named alias for setActiveLesson used in QuizComponent onContinue
-  const selectLesson = useCallback((lesson: Lesson) => {
-    setActiveLesson(lesson);
-  }, []);
-
-  // ── Persist autoplay preference ──────────────────────────────────────────
-  const handleAutoplayChange = useCallback((enabled: boolean) => {
-    setAutoplay(enabled);
-    if (typeof window !== 'undefined') {
-      window.localStorage.setItem(AUTOPLAY_STORAGE_KEY, String(enabled));
-    }
-    if (!enabled) setShowCountdown(false);
-  }, []);
-
-  // ── Video ended handler ──────────────────────────────────────────────────
-  const handleVideoEnded = useCallback(() => {
-    if (autoplay && nextLesson) {
-      setShowCountdown(true);
-    }
-  }, [autoplay, nextLesson]);
-
-  // ── Navigate to next lecture ─────────────────────────────────────────────
-  const goToNext = useCallback(() => {
-    if (!nextLesson) return;
-    setShowCountdown(false);
-    setActiveLesson(nextLesson);
-  }, [nextLesson]);
-
-  const cancelCountdown = useCallback(() => {
-    setShowCountdown(false);
-  }, []);
-
-  // ── Initial data load ────────────────────────────────────────────────────
-  const loadCourseData = useCallback(() => {
-    setLoading(true);
-    setLoadError(null);
+  useEffect(() => {
     Promise.all([
       coursesApi.get(id),
       enrollmentsApi.get(id),
     ]).then(([c, e]) => {
       setCourse(c);
       setEnrollment(e);
-      // Open first module by default
-      if (c.modules?.[0]) setExpanded({ [c.modules[0].id]: true });
-      // Start from first incomplete lesson
-      const allLessons = flatLessons(c);
+      
+      // Find lesson from URL param or fall back to first incomplete
+      const allLessons = c.modules?.flatMap((m) => m.lessons) ?? [];
       const completedIds = new Set(
-        e.lessonProgress?.filter((p: { completed: boolean }) => p.completed).map((p: { lessonId: string }) => p.lessonId),
+        e.lessonProgress?.filter((p) => p.completed).map((p) => p.lessonId),
       );
-      const first = allLessons.find((l) => !completedIds.has(l.id)) ?? allLessons[0];
-      if (first) setActiveLesson(first);
-    })
-    .catch((err) => {
-      console.error(err);
-      const status = (err as { response?: { status?: number }; status?: number })?.response?.status ?? (err as { status?: number })?.status;
-      if (status === 404) {
-        setLoadError('notFound');
-      } else {
-        setLoadError('network');
+      
+      let lessonToOpen: Lesson | null = null;
+      
+      if (lessonParam) {
+        // Try to find lesson by ID from URL param
+        lessonToOpen = allLessons.find((l) => l.id === lessonParam) ?? null;
+      }
+      
+      if (!lessonToOpen) {
+        // Fall back to first incomplete lesson, then first lesson
+        lessonToOpen = allLessons.find((l) => !completedIds.has(l.id)) ?? allLessons[0] ?? null;
+      }
+      
+      if (lessonToOpen) {
+        setActiveLesson(lessonToOpen);
+        // Expand the module containing this lesson
+        const moduleId = lessonToOpen.moduleId;
+        setExpanded({ [moduleId]: true });
+      } else if (c.modules?.[0]) {
+        // Open first module by default
+        setExpanded({ [c.modules[0].id]: true });
       }
     })
+    .catch(console.error)
     .finally(() => setLoading(false));
-  }, [id]);
 
-  useEffect(() => {
-    loadCourseData();
     return () => { if (progressRef.current) clearInterval(progressRef.current); };
-  }, [loadCourseData]);
+  }, [id, lessonParam]);
 
-  // ── Course completion detection ──────────────────────────────────────────
+  // Update URL when active lesson changes
   useEffect(() => {
-    if (!course || !enrollment) return;
-
-    const totalLessons = flatLessons(course).length;
-    const completedCount = enrollment.lessonProgress?.filter((p: { completed: boolean }) => p.completed).length ?? 0;
-    const isComplete = totalLessons > 0 && completedCount >= totalLessons;
-    const previouslyIncomplete =
-      previousCompletedCountRef.current === null ||
-      previousCompletedCountRef.current < totalLessons;
-    const newlyCompleted =
-      hasInitializedCompletionState.current && previouslyIncomplete && isComplete;
-
-    previousCompletedCountRef.current = completedCount;
-    hasInitializedCompletionState.current = true;
-
-    if (!isComplete) {
-      setShowCompletionModal(false);
-      return;
+    if (activeLesson) {
+      const newUrl = `/dashboard/courses/${id}/learn?lesson=${activeLesson.id}`;
+      router.replace(newUrl);
     }
+  }, [activeLesson?.id, id, router]);
 
-    const storageKey = `course-completion:${course.id}`;
-    const hasSeenModal =
-      typeof window !== 'undefined' &&
-      window.localStorage.getItem(storageKey) === 'true';
-
-    if (newlyCompleted && !hasSeenModal) {
-      setShowCompletionModal(true);
-      if (typeof window !== "undefined") {
-        window.localStorage.setItem(storageKey, "true");
-      }
-    } else {
-      setShowCompletionModal(false);
-    }
-  }, [course, enrollment]);
-
-  // ── Dismiss countdown when lesson changes (e.g. sidebar click) ──────────
-  useEffect(() => {
-    setShowCountdown(false);
-    setMarkError(null);
-  }, [activeLesson]);
-
-  // ── Helpers ──────────────────────────────────────────────────────────────
   const isLessonCompleted = (lessonId: string) =>
-    enrollment?.lessonProgress?.some(
-      (p: { lessonId: string; completed: boolean }) => p.lessonId === lessonId && p.completed,
-    ) ?? false;
+    enrollment?.lessonProgress?.some((p) => p.lessonId === lessonId && p.completed) ?? false;
 
   const handleMarkComplete = async () => {
     if (!activeLesson || !enrollment || marking) return;
     setMarking(true);
-    setMarkError(null);
     try {
       await lessonsApi.markComplete(activeLesson.id, enrollment.id);
+      // Re-fetch enrollment to update progress
       const updated = await enrollmentsApi.get(id);
       setEnrollment(updated);
-    } catch (err) {
-      console.error(err);
-      setMarkError('Failed to mark lesson as complete. Please try again.');
     } finally {
       setMarking(false);
     }
   };
 
-  const totalLessons   = course ? flatLessons(course).length : 0;
-  const completedCount = enrollment?.lessonProgress?.filter((p: { completed: boolean }) => p.completed).length ?? 0;
+  const handleSelectLesson = (lesson: Lesson) => {
+    setActiveLesson(lesson);
+    // Close sidebar on mobile after selecting
+    if (typeof window !== 'undefined' && window.innerWidth < 768) {
+      setSidebarOpen(false);
+    }
+  };
+
+  const totalLessons   = course?.modules?.flatMap((m) => m.lessons).length ?? 0;
+  const completedCount = enrollment?.lessonProgress?.filter((p) => p.completed).length ?? 0;
   const progress       = totalLessons > 0 ? Math.round((completedCount / totalLessons) * 100) : 0;
 
-  // ── Render ────────────────────────────────────────────────────────────────
   if (loading) return (
     <div className="flex justify-center py-16">
       <Loader2 className="w-6 h-6 text-saffron-500 animate-spin" />
     </div>
   );
 
-  if (loadError === 'network') {
-    return (
-      <div className="flex flex-col items-center justify-center py-16 px-4 text-center">
-        <p className="text-ink-700 font-medium mb-3">Failed to load course. Please check your connection.</p>
-        <button
-          onClick={loadCourseData}
-          className="btn-primary inline-flex items-center gap-2"
-        >
-          Try again
-        </button>
-      </div>
-    );
-  }
-
-  if (loadError === 'notFound' || !course)
-    return (
-      <div className="text-center py-16 text-ink-500">Course not found.</div>
-    );
+  if (!course) return <div className="text-center py-16 text-ink-500">Course not found.</div>;
 
   return (
-    <div className="-m-3 flex h-[calc(100vh-4rem)] flex-col overflow-hidden sm:-m-6 md:flex-row">
-      {course && (
-        <CourseCompletionModal
-          open={showCompletionModal}
-          courseTitle={course.title}
-          courseId={course.id}
-          onClose={() => setShowCompletionModal(false)}
-        />
-      )}
+    <div className="-m-6 flex flex-col h-[calc(100vh-3.5rem)] overflow-hidden md:flex-row">
+      {/* Mobile toggle button */}
+      <div className="md:hidden border-b border-ink-100 bg-white">
+        <button
+          onClick={() => setSidebarOpen(!sidebarOpen)}
+          className="flex items-center justify-between w-full px-4 py-3"
+        >
+          <span className="text-sm font-semibold text-ink-900">Curriculum</span>
+          {sidebarOpen ? (
+            <X className="w-4 h-4 text-ink-500" />
+          ) : (
+            <Menu className="w-4 h-4 text-ink-500" />
+          )}
+        </button>
+      </div>
 
-      {/* ── Lesson sidebar ──────────────────────────────────────────────── */}
-      <aside className="w-72 bg-white border-r border-ink-100 flex flex-col flex-shrink-0 overflow-y-auto">
+      {/* Lesson sidebar */}
+      <aside
+        className={cn(
+          'absolute md:relative md:flex w-full md:w-72 bg-white border-r border-ink-100 flex-col overflow-y-auto transition-all duration-200 z-40 md:z-0',
+          sidebarOpen ? 'flex h-[40vh]' : 'hidden md:flex',
+        )}
+      >
         {/* Header */}
         <div className="p-4 border-b border-ink-100">
-          <Link
-            href={`/dashboard/courses/${id}`}
-            className="flex items-center gap-1.5 text-xs text-ink-400 hover:text-ink-700 mb-2 transition-colors"
-          >
+          <Link href={`/dashboard/courses/${id}`}
+            className="flex items-center gap-1.5 text-xs text-ink-400 hover:text-ink-700 mb-2 transition-colors">
             <ArrowLeft className="w-3 h-3" />
             Back to overview
           </Link>
@@ -276,231 +156,128 @@ export default function LearnPage() {
           </div>
         </div>
 
-        {/* Sidebar tab switcher */}
-        <div className="flex border-b border-ink-100 text-xs font-medium">
-          {(['lessons', 'notes', 'qa'] as SidebarTab[]).map((tab) => (
-            <button
-              key={tab}
-              onClick={() => setSidebarTab(tab)}
-              className={cn(
-                'flex-1 py-2 capitalize transition-colors',
-                sidebarTab === tab
-                  ? 'text-saffron-700 border-b-2 border-saffron-500'
-                  : 'text-ink-400 hover:text-ink-700',
+        {/* Modules + lessons */}
+        <div className="flex-1">
+          {course.modules?.map((module, mi) => (
+            <div key={module.id} className="border-b border-ink-50">
+              <button
+                onClick={() => setExpanded((p) => ({ ...p, [module.id]: !p[module.id] }))}
+                className="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-ink-50 transition-colors"
+              >
+                <div>
+                  <p className="text-xs font-semibold text-ink-700">
+                    Module {mi + 1}: {module.title}
+                  </p>
+                  <p className="text-[10px] text-ink-400 mt-0.5">
+                    {module.lessons.filter((l) => isLessonCompleted(l.id)).length}/
+                    {module.lessons.length} done
+                  </p>
+                </div>
+                {expanded[module.id]
+                  ? <ChevronDown className="w-3.5 h-3.5 text-ink-400" />
+                  : <ChevronRight className="w-3.5 h-3.5 text-ink-400" />
+                }
+              </button>
+
+              {expanded[module.id] && (
+                <div className="pb-1">
+                  {module.lessons.map((lesson) => {
+                    const done    = isLessonCompleted(lesson.id);
+                    const active  = activeLesson?.id === lesson.id;
+                    return (
+                      <button
+                        key={lesson.id}
+                        onClick={() => handleSelectLesson(lesson)}
+                        className={cn(
+                          'w-full flex items-start gap-2.5 px-4 py-2.5 text-left transition-colors',
+                          active ? 'bg-saffron-50' : 'hover:bg-ink-50',
+                        )}
+                      >
+                        {done
+                          ? <CheckCircle2 className="w-4 h-4 text-leaf-500 flex-shrink-0 mt-0.5" />
+                          : <Circle className={cn('w-4 h-4 flex-shrink-0 mt-0.5', active ? 'text-saffron-500' : 'text-ink-300')} />
+                        }
+                        <div className="min-w-0">
+                          <p className={cn(
+                            'text-xs leading-snug',
+                            active ? 'font-semibold text-saffron-700' : done ? 'text-ink-500' : 'text-ink-700',
+                          )}>
+                            {lesson.title}
+                          </p>
+                          {lesson.videoDuration && (
+                            <p className="text-[10px] text-ink-400 mt-0.5">
+                              {formatDuration(lesson.videoDuration)}
+                            </p>
+                          )}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
               )}
-            >
-              {tab}
-            </button>
+            </div>
           ))}
         </div>
-
-        {/* Modules + lessons */}
-        {sidebarTab === "lessons" && (
-          <div className="flex-1">
-            {course.modules?.map((module) => (
-              <div key={module.id} className="border-b border-ink-50">
-                <button
-                  onClick={() =>
-                    setExpanded((p) => ({ ...p, [module.id]: !p[module.id] }))
-                  }
-                  className="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-ink-50 transition-colors"
-                >
-                  <div className="min-w-0 flex-1">
-                    <p className="text-xs font-semibold text-ink-700 truncate">{module.title}</p>
-                    <p className="text-[10px] text-ink-400 mt-0.5">
-                      {module.lessons.length} lesson{module.lessons.length !== 1 ? 's' : ''}
-                    </p>
-                  </div>
-                  {expanded[module.id] ? (
-                    <ChevronDown className="w-3.5 h-3.5 text-ink-400 flex-shrink-0" />
-                  ) : (
-                    <ChevronRight className="w-3.5 h-3.5 text-ink-400 flex-shrink-0" />
-                  )}
-                </button>
-
-                {expanded[module.id] && (
-                  <div className="pb-1">
-                    {module.lessons.map((lesson) => {
-                      const done   = isLessonCompleted(lesson.id);
-                      const active = activeLesson?.id === lesson.id;
-                      return (
-                        <button
-                          key={lesson.id}
-                          onClick={() => setActiveLesson(lesson)}
-                          className={cn(
-                            'w-full flex items-start gap-2.5 px-4 py-2.5 text-left transition-colors',
-                            active ? 'bg-saffron-50' : 'hover:bg-ink-50',
-                          )}
-                        >
-                          {done ? (
-                            <CheckCircle2 className="w-4 h-4 text-leaf-500 flex-shrink-0 mt-0.5" />
-                          ) : (
-                            <Circle
-                              className={cn(
-                                'w-4 h-4 flex-shrink-0 mt-0.5',
-                                active ? 'text-saffron-500' : 'text-ink-300',
-                              )}
-                            />
-                          )}
-                          <div className="min-w-0">
-                            <p
-                              className={cn(
-                                'text-xs leading-snug',
-                                active
-                                  ? 'font-semibold text-saffron-700'
-                                  : done
-                                    ? 'text-ink-500'
-                                    : 'text-ink-700',
-                              )}
-                            >
-                              {lesson.title}
-                            </p>
-                            {lesson.videoDuration && (
-                              <p className="text-[10px] text-ink-400 mt-0.5">
-                                {formatDuration(lesson.videoDuration)}
-                              </p>
-                            )}
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-
-        {sidebarTab === "notes" && activeLesson && (
-          <div className="flex-1 overflow-hidden">
-            <NotesPanel
-              courseId={id}
-              lectureId={activeLesson.id}
-              videoRef={videoRef}
-              courseTitle={course.title}
-              lectureTitle={activeLesson.title}
-            />
-          </div>
-        )}
-
-        {sidebarTab === "qa" && (
-          <div className="flex-1 flex items-center justify-center text-ink-400 px-4">
-            <div className="text-center">
-              <MessageSquare className="w-8 h-8 mx-auto mb-2 opacity-40" />
-              <p className="text-xs">Q&amp;A coming soon</p>
-            </div>
-          </div>
-        )}
       </aside>
 
-      {/* ── Main lesson content ──────────────────────────────────────────── */}
+      {/* Main lesson content */}
       <div className="flex-1 overflow-y-auto p-6">
         {activeLesson ? (
           <div className="max-w-3xl mx-auto">
-            {/* Breadcrumb — sits above the lesson content */}
-            <Breadcrumb
-              items={[
-                { label: "Dashboard", href: "/dashboard" },
-                { label: "My Courses", href: "/dashboard/courses" },
-                { label: course.title, href: `/dashboard/courses/${id}` },
-                { label: activeLesson.title },
-              ]}
-              className="mb-5"
-            />
+            {/* Materials */}
+            {activeLesson.materials && activeLesson.materials.length > 0 && (
+              <MaterialsList materials={activeLesson.materials} />
+            )}
 
             {/* Video */}
             {activeLesson.videoUrl && (
-              <div className="relative aspect-video rounded-2xl overflow-hidden bg-black mb-5">
-                <VideoPlayer
+              <div className="aspect-video rounded-2xl overflow-hidden bg-black mb-5">
+                <video
                   key={activeLesson.videoUrl}
-                  ref={videoRef}
                   src={activeLesson.videoUrl}
-                  videoQualities={activeLesson.videoQualities}
-                  enrollmentId={enrollment?.id}
-                  lessonId={activeLesson.id}
-                  autoplay={autoplay}
-                  onAutoplayChange={handleAutoplayChange}
-                  onEnded={handleVideoEnded}
+                  controls
                   className="w-full h-full"
+                  controlsList="nodownload"
                 />
-
-                {/* Autoplay countdown overlay */}
-                {showCountdown && nextLesson && (
-                  <AutoplayCountdown
-                    nextTitle={nextLesson.title}
-                    seconds={5}
-                    onComplete={goToNext}
-                    onCancel={cancelCountdown}
-                  />
-                )}
               </div>
             )}
 
             {/* Text content */}
-            {activeLesson.type === "TEXT" && activeLesson.content && (
+            {activeLesson.type === 'TEXT' && activeLesson.content && (
               <div className="card p-6 mb-5 prose prose-sm max-w-none">
-                <div
-                  dangerouslySetInnerHTML={{ __html: sanitizeHtml(activeLesson.content) }}
-                />
+                <div dangerouslySetInnerHTML={{ __html: activeLesson.content }} />
               </div>
             )}
 
-            {/* Quiz / assessment */}
-            {activeLesson.type === "QUIZ" && (
-              <div className="mb-5">
-                <QuizComponent
-                  questions={activeLesson.quiz ?? DEFAULT_QUIZ_QUESTIONS}
-                  onContinue={
-                    nextLesson ? () => selectLesson(nextLesson) : undefined
-                  }
-                />
-              </div>
-            )}
-
-            {/* Title + mark complete row */}
-            <div className="flex items-start justify-between mb-5">
+            <div className="flex items-start justify-between mb-5 flex-col sm:flex-row gap-4">
               <div>
                 <h1 className="font-display text-xl font-semibold text-ink-900 mb-1">
                   {activeLesson.title}
                 </h1>
                 {activeLesson.description && (
-                  <p className="text-sm text-ink-500">
-                    {activeLesson.description}
-                  </p>
+                  <p className="text-sm text-ink-500">{activeLesson.description}</p>
                 )}
               </div>
 
-              <div className="flex flex-col items-end flex-shrink-0 ml-4">
-                {!isLessonCompleted(activeLesson.id) ? (
-                  <button
-                    onClick={handleMarkComplete}
-                    disabled={marking}
-                    className="btn-leaf flex-shrink-0"
-                  >
-                    {marking ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <CheckCircle2 className="w-4 h-4" />
-                    )}
-                    Mark complete
-                  </button>
-                ) : (
-                  <span className="inline-flex items-center gap-1.5 text-xs font-medium text-leaf-600 bg-leaf-50 px-3 py-1.5 rounded-xl">
-                    <CheckCircle2 className="w-3.5 h-3.5" />
-                    Completed
-                  </span>
-                )}
-                {markError && (
-                  <p role="alert" className="mt-2 text-xs text-rose-500 text-right">
-                    {markError}
-                  </p>
-                )}
-              </div>
+              {!isLessonCompleted(activeLesson.id) ? (
+                <button
+                  onClick={handleMarkComplete}
+                  disabled={marking}
+                  className="btn-leaf flex-shrink-0"
+                >
+                  {marking
+                    ? <Loader2 className="w-4 h-4 animate-spin" />
+                    : <CheckCircle2 className="w-4 h-4" />
+                  }
+                  Mark complete
+                </button>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 text-xs font-medium text-leaf-600 bg-leaf-50 px-3 py-1.5 rounded-xl">
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  Completed
+                </span>
+              )}
             </div>
-
-            {activeLesson.type === 'ASSIGNMENT' && (
-              <AssignmentSubmission key={activeLesson.id} lesson={activeLesson} />
-            )}
 
             {/* Downloadable resource */}
             {activeLesson.resourceUrl && (
@@ -514,35 +291,18 @@ export default function LearnPage() {
               </a>
             )}
 
-            {/* Next lecture button (shown when autoplay is OFF and there's no video) */}
-            {!autoplay && nextLesson && !activeLesson.videoUrl && (
-              <div className="flex justify-end mb-5">
-                <button
-                  onClick={goToNext}
-                  className="btn-secondary inline-flex items-center gap-2"
-                >
-                  <SkipForward className="w-4 h-4" />
-                  Next lecture
-                </button>
-              </div>
-            )}
-
             {/* Completion celebration */}
-            {progress === 100 && !showCompletionModal && (
+            {progress === 100 && (
               <div className="card p-6 bg-gradient-to-br from-saffron-50 to-leaf-50 border-saffron-100 text-center">
                 <div className="text-4xl mb-3">🎓</div>
                 <h2 className="font-display text-xl font-semibold text-ink-900 mb-2">
                   Course complete!
                 </h2>
                 <p className="text-sm text-ink-500 mb-4">
-                  You&apos;ve finished all lessons. Your certificate will be
-                  issued shortly.
+                  You've finished all lessons. Your certificate will be issued shortly.
                 </p>
-                <Link
-                  href="/dashboard/certificates"
-                  className="btn-primary inline-flex"
-                >
-                  <Award className="w-4 h-4" />
+                <Link href="/dashboard/certificates" className="btn-primary inline-flex">
+                  <CheckCircle2 className="w-4 h-4" />
                   View my certificates
                 </Link>
               </div>
@@ -557,3 +317,6 @@ export default function LearnPage() {
     </div>
   );
 }
+
+// Import Award for completion celebration
+import { Award } from 'lucide-react';
